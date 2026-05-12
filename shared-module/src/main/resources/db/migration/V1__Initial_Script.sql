@@ -1,0 +1,278 @@
+-- ============================================================
+-- V1__init_schema.sql
+-- BVB Banking — base schema
+-- PostgreSQL (Neon) · UUID primary keys · ENUMs
+-- ============================================================
+
+-- ── ENUMS ─────────────────────────────────────────────────────────────────────
+
+DO $$ BEGIN
+    CREATE TYPE CUSTOMER_TYPE_NAME_ AS ENUM ('INDIVIDUAL', 'BUSINESS');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE ACCOUNT_TYPE_ AS ENUM ('PAYMENT', 'SAVINGS', 'CREDIT');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE ACCOUNT_STATUS_ AS ENUM ('ACTIVE', 'LOCKED', 'CLOSED');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE TRANSACTION_TYPE_ AS ENUM ('DEPOSIT', 'WITHDRAWAL', 'TRANSFER');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- PENDING: saved before calling AccountService; FAILED: AccountService rejected
+DO $$ BEGIN
+    CREATE TYPE TRANSACTION_STATUS_ AS ENUM ('PENDING', 'COMPLETED', 'FAILED', 'ROLLED_BACK');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE ROLLBACK_STATUS_ AS ENUM ('SUCCESS', 'PERMANENTLY_FAILED', 'FAILED');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE ALERT_TYPE_ AS ENUM ('AMOUNT_THRESHOLD', 'RAPID_SUCCESSION', 'UNUSUAL_LOCATION');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE ALERT_STATUS_ AS ENUM ('OPEN', 'UNDER_REVIEW', 'RESOLVED', 'DISMISSED');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE USER_ROLE_ AS ENUM ('ADMIN', 'USER');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE AUDIT_ACTION_ AS ENUM (
+        'CREATE',
+        'UPDATE',
+        'DELETE',
+        'ACCOUNT_ACTIVE',
+        'ACCOUNT_LOCKED',
+        'ACCOUNT_CLOSED',
+        'DEPOSIT',
+        'WITHDRAWAL',
+        'TRANSFER',
+        'TRANSACTION_ROLLED_BACK'
+        );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE AUDIT_ENTITY_ AS ENUM ('CUSTOMER', 'ACCOUNT', 'TRANSACTION');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE RECURRING_JOB_TYPE_ AS ENUM ('AUTO_DEBIT', 'SAVINGS', 'LOAN_PAYMENT', 'TOP_UP');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE RECURRING_JOB_STATUS_ AS ENUM ('ACTIVE', 'PAUSED', 'CANCELLED');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE RECURRING_RUN_STATUS_ AS ENUM ('SUCCESS', 'FAILED', 'SKIPPED');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+
+-- ── CUSTOMER_TYPE ─────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS CUSTOMER_TYPE (
+    ID                    UUID                PRIMARY KEY,
+    TYPE_NAME             CUSTOMER_TYPE_NAME_ NOT NULL UNIQUE,
+    MAX_TRANSACTION_LIMIT DECIMAL(18,2)       NOT NULL CHECK (MAX_TRANSACTION_LIMIT > 0),
+    DAILY_LIMIT           DECIMAL(18,2)       NOT NULL CHECK (DAILY_LIMIT > 0),
+    CREATED_AT            TIMESTAMP           NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ── CUSTOMER ──────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS CUSTOMER (
+    ID               UUID         PRIMARY KEY,
+    CUSTOMER_TYPE_ID UUID         NOT NULL REFERENCES CUSTOMER_TYPE(ID),
+    FULL_NAME        VARCHAR(255) NOT NULL,
+    EMAIL            VARCHAR(255) NOT NULL UNIQUE,
+    PHONE            VARCHAR(20)  NOT NULL UNIQUE,
+    ADDRESS          VARCHAR(255) NOT NULL,
+    CITY             VARCHAR(100) NOT NULL,
+    NATIONAL_ID      VARCHAR(20)  NOT NULL UNIQUE,
+    CREATED_AT       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UPDATED_AT       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ── USER_AUTH ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS USER_AUTH (
+    ID            UUID         PRIMARY KEY,
+    CUSTOMER_ID   UUID         NOT NULL UNIQUE REFERENCES CUSTOMER(ID),
+    USERNAME      VARCHAR(255) NOT NULL UNIQUE,
+    PASSWORD_HASH VARCHAR(255) NOT NULL,
+    ROLE          USER_ROLE_   NOT NULL DEFAULT 'USER',
+    ACTIVE        BOOLEAN      NOT NULL DEFAULT TRUE,
+    CREATED_AT    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    LAST_LOGIN    TIMESTAMP
+);
+
+
+-- ── ACCOUNT ───────────────────────────────────────────────────────────────────
+
+CREATE SEQUENCE IF NOT EXISTS account_number_seq
+    START WITH 10000000
+    INCREMENT BY 1;
+
+CREATE TABLE IF NOT EXISTS ACCOUNT (
+    ID                UUID            PRIMARY KEY,
+    CUSTOMER_ID       UUID            NOT NULL REFERENCES CUSTOMER(ID),
+    ACCOUNT_NUMBER    VARCHAR(20)     NOT NULL UNIQUE DEFAULT (
+                          nextval('account_number_seq')::text
+                      ),
+    ACCOUNT_TYPE      ACCOUNT_TYPE_   NOT NULL,
+    BALANCE           DECIMAL(18,2)   NOT NULL DEFAULT 0.00 CHECK (BALANCE >= 0),
+    TRANSACTION_LIMIT DECIMAL(18,2)   NOT NULL CHECK (TRANSACTION_LIMIT > 0),
+    STATUS            ACCOUNT_STATUS_ NOT NULL DEFAULT 'ACTIVE',
+    OPENED_AT         TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UPDATED_AT        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ── TRANSACTION ───────────────────────────────────────────────────────────────
+-- PENDING is inserted before calling AccountService.
+-- Transitions: PENDING → COMPLETED (success) | PENDING → FAILED (AccountService error)
+-- COMPLETED → ROLLED_BACK (reversal executed)
+
+CREATE TABLE IF NOT EXISTS TRANSACTION (
+    ID                 UUID                PRIMARY KEY,
+    SOURCE_ACCOUNT_ID  UUID                NOT NULL REFERENCES ACCOUNT(ID),
+    IDEMPOTENCY_KEY    UUID                NOT NULL UNIQUE,
+    TARGET_ACCOUNT_ID  UUID                REFERENCES ACCOUNT(ID),
+    TRANSACTION_TYPE   TRANSACTION_TYPE_   NOT NULL,
+    AMOUNT             DECIMAL(18,2)       NOT NULL CHECK (AMOUNT > 0),
+    TRANSACTION_FEE    DECIMAL(18,2)       NOT NULL DEFAULT 0.00 CHECK (TRANSACTION_FEE >= 0),
+    LOCATION           VARCHAR(255),
+    TRANSACTION_STATUS TRANSACTION_STATUS_ NOT NULL DEFAULT 'PENDING',
+    EXECUTED_AT        TIMESTAMP,
+    CREATED_AT         TIMESTAMP           NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UPDATED_AT         TIMESTAMP           NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CHECK (
+        (TRANSACTION_TYPE = 'TRANSFER' AND TARGET_ACCOUNT_ID IS NOT NULL)
+            OR (TRANSACTION_TYPE != 'TRANSFER' AND TARGET_ACCOUNT_ID IS NULL)
+        ),
+    CHECK (SOURCE_ACCOUNT_ID != TARGET_ACCOUNT_ID OR TARGET_ACCOUNT_ID IS NULL)
+);
+
+
+-- ── TRANSACTION_ROLLBACK ──────────────────────────────────────────────────────
+-- One row per attempt (up to MAX_ROLLBACK_ATTEMPTS = 3).
+-- rollback_status: FAILED (this attempt failed, may retry) |
+--                  SUCCESS (reversed) | PERMANENTLY_FAILED (all attempts exhausted)
+
+CREATE TABLE IF NOT EXISTS TRANSACTION_ROLLBACK (
+    ID               UUID             PRIMARY KEY,
+    TRANSACTION_ID   UUID             NOT NULL REFERENCES TRANSACTION(ID),
+    ATTEMPT_NUMBER   INT              NOT NULL CHECK (ATTEMPT_NUMBER BETWEEN 1 AND 3),
+    ROLLBACK_STATUS  ROLLBACK_STATUS_ NOT NULL,
+    REASON           VARCHAR(500),
+    ERROR_DETAIL     TEXT,
+    INITIATED_BY     VARCHAR(100)     NOT NULL,
+    CREATED_AT       TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ── AUDIT_LOG ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS AUDIT_LOG (
+    ID              UUID          PRIMARY KEY,
+    ENTITY_TYPE     AUDIT_ENTITY_ NOT NULL,
+    ENTITY_ID       UUID          NOT NULL,
+    ACTION          AUDIT_ACTION_ NOT NULL,
+    OLD_VALUE       TEXT,
+    NEW_VALUE       TEXT,
+    CHANGED_BY      VARCHAR(255)  NOT NULL,
+    CHANGED_BY_ROLE USER_ROLE_    NOT NULL,
+    REASON          VARCHAR(500),
+    IP_ADDRESS      VARCHAR(45),
+    CHANGED_AT      TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ── RECURRING_JOB ─────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS RECURRING_JOB (
+    ID          UUID                  PRIMARY KEY,
+    ACCOUNT_ID  UUID                  NOT NULL REFERENCES ACCOUNT(ID),
+    JOB_NAME    VARCHAR(255)          NOT NULL,
+    JOB_TYPE    RECURRING_JOB_TYPE_   NOT NULL,
+    AMOUNT      DECIMAL(18,2)         NOT NULL CHECK (AMOUNT > 0),
+    DESCRIPTION VARCHAR(500),
+    STATUS      RECURRING_JOB_STATUS_ NOT NULL DEFAULT 'ACTIVE',
+    CREATED_AT  TIMESTAMP             NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UPDATED_AT  TIMESTAMP             NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ── RECURRING_SCHEDULE ────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS RECURRING_SCHEDULE (
+    ID              UUID         PRIMARY KEY,
+    JOB_ID          UUID         NOT NULL REFERENCES RECURRING_JOB(ID),
+    CRON_EXPRESSION VARCHAR(100) NOT NULL,
+    ACTIVE          BOOLEAN      NOT NULL DEFAULT TRUE,
+    MAX_RETRIES     INT          NOT NULL DEFAULT 3 CHECK (MAX_RETRIES >= 0),
+    RETRY_COUNT     INT          NOT NULL DEFAULT 0 CHECK (RETRY_COUNT >= 0),
+    NEXT_RUN        TIMESTAMP,
+    LAST_RUN        TIMESTAMP,
+    VALID_FROM      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    VALID_UNTIL     TIMESTAMP,
+
+    CHECK (RETRY_COUNT <= MAX_RETRIES),
+    CHECK (VALID_UNTIL IS NULL OR VALID_UNTIL > VALID_FROM)
+);
+
+
+-- ── RECURRING_AUDIT_LOG ───────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS RECURRING_AUDIT_LOG (
+    ID               UUID                  PRIMARY KEY,
+    SCHEDULE_ID      UUID                  NOT NULL REFERENCES RECURRING_SCHEDULE(ID),
+    STATUS           RECURRING_RUN_STATUS_ NOT NULL,
+    RESULT_MESSAGE   TEXT,
+    AMOUNT_PROCESSED DECIMAL(18,2)         CHECK (AMOUNT_PROCESSED >= 0),
+    DURATION_MS      INT                   CHECK (DURATION_MS >= 0),
+    EXECUTED_AT      TIMESTAMP             NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ── ALERT ─────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS ALERT (
+    ID             UUID          PRIMARY KEY,
+    TRANSACTION_ID UUID          NOT NULL REFERENCES TRANSACTION(ID),
+    ALERT_TYPE     ALERT_TYPE_   NOT NULL,
+    MESSAGE        VARCHAR(500)  NOT NULL,
+    STATUS         ALERT_STATUS_ NOT NULL DEFAULT 'OPEN',
+    CREATED_AT     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    RESOLVED_AT    TIMESTAMP,
+
+    CHECK (
+        (STATUS IN ('RESOLVED', 'DISMISSED') AND RESOLVED_AT IS NOT NULL)
+            OR (STATUS IN ('OPEN', 'UNDER_REVIEW') AND RESOLVED_AT IS NULL)
+        )
+);
+
