@@ -23,7 +23,7 @@ A Spring Boot modular monolith that handles customer management, account operati
 
 ## Architecture Overview
 
-The system is a **modular monolith**: a single deployable Spring Boot application (`app-module`) that composes eight Maven sub-modules. Each module owns its own domain, repository, and service layer. Inter-module calls happen in-process via Spring beans — no HTTP round-trips between modules.
+The system is a **modular monolith**: a single deployable Spring Boot application (`app-module`) that composes eight Maven sub-modules. Each module owns its own domain, repository, and service layer. Inter-module communication happens in-process via Spring `ApplicationEventPublisher` and `@TransactionalEventListener` — no HTTP round-trips between modules.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -41,14 +41,15 @@ The system is a **modular monolith**: a single deployable Spring Boot applicatio
 │          │                  │                     │              │
 │  ┌───────▼───────────────────▼─────────────────────▼───────────┐ │
 │  │                      shared-module                          │ │
-│  │  JWT auth · Security config · Redis pub/sub · PageResponse  │ │
-│  │  UserPrincipal · AuditLogPublisher · InsufficientBalance    │ │
+│  │  JWT auth · Security config · PageResponse                  │ │
+│  │  UserPrincipal · AuditLogEvent · AuditLogPublisher          │ │
+│  │  InsufficientBalanceException                               │ │
 │  └───────────────────────────────────────────────────────────┬─┘ │
 │                                                              │   │
 │  ┌─────────────────┐  ┌──────────────┐  ┌───────────────────▼─┐ │
 │  │ schedule-module │  │ alert-module │  │ audit-module        │ │
 │  │                 │  │              │  │                     │ │
-│  │ RecurringJob    │  │ Alert domain │  │ Redis subscriber    │ │
+│  │ RecurringJob    │  │ Alert domain │  │ @TransactionalEvent │ │
 │  │ Reconciliation  │  │              │  │ AuditLog persistence│ │
 │  └─────────────────┘  └──────────────┘  └─────────────────────┘ │
 └──────────────────────────────────────────────────────────────────┘
@@ -57,7 +58,7 @@ The system is a **modular monolith**: a single deployable Spring Boot applicatio
     │  PostgreSQL  │                         │     Redis       │
     │  (Neon)      │                         │  · JWT blacklist│
     │  · Flyway    │                         │  · Cache        │
-    │  · ENUM types│                         │  · audit:log    │
+    │  · ENUM types│                         │                 │
     └─────────────┘                         └─────────────────┘
 ```
 
@@ -67,11 +68,11 @@ The system is a **modular monolith**: a single deployable Spring Boot applicatio
 
 | Module | Responsibility |
 |---|---|
-| `shared-module` | Cross-cutting concerns: JWT filter, security config, Redis pub/sub infrastructure, `UserPrincipal` interface, `PageResponse`, `InsufficientBalanceException`, `AuthService` |
+| `shared-module` | Cross-cutting concerns: JWT filter, security config, `UserPrincipal` interface, `PageResponse`, `AuditLogEvent`, `AuditLogPublisher`, `InsufficientBalanceException`, `AuthService` |
 | `customer-module` | Customer and `UserAuth` CRUD; login/logout/refresh endpoints; `UserDetailsService` implementation |
-| `account-module` | Account lifecycle (create, lock, unlock, close); balance mutations (`deposit`, `withdraw`, `transfer`) with `SELECT FOR UPDATE` row-level locking; ownership verification |
+| `account-module` | Account lifecycle (create, lock, unlock, close); balance mutations (`deposit`, `withdraw`, `transfer`) with `SELECT FOR UPDATE` row-level locking ordered by UUID to prevent deadlock; ownership verification |
 | `transaction-module` | Transaction creation (PENDING-first), idempotency key deduplication, rollback with up to 3 retry attempts, search with `JpaSpecification` |
-| `audit-module` | Consumes `AuditLogEvent` messages from Redis; persists to `audit_log` table; exposes query endpoints for ADMIN and USER roles |
+| `audit-module` | Subscribes to `AuditLogEvent` via `@TransactionalEventListener(AFTER_COMMIT)`; persists to `audit_log` table asynchronously on `transferExecutor` thread pool; exposes query endpoints for ADMIN and USER roles |
 | `schedule-module` | `RecurringTransactionJob` (dispatches due schedules every 60 s); `ReconciliationJob` (marks stale PENDING transactions FAILED every 60 s) |
 | `alert-module` | Alert domain (amount threshold, rapid succession, unusual location detection) |
 | `app-module` | Entry point only — composes all modules, Flyway migrations, Swagger/OpenAPI definition, dynamic port binding |
@@ -80,12 +81,12 @@ The system is a **modular monolith**: a single deployable Spring Boot applicatio
 
 ```
 app-module
-├── customer-module  →  shared-module
-├── account-module   →  shared-module, customer-module, audit-module
-├── transaction-module → shared-module, account-module
-├── audit-module     →  shared-module
-├── schedule-module  →  shared-module, transaction-module
-└── alert-module     →  shared-module
+├── customer-module    →  shared-module
+├── account-module     →  shared-module, customer-module, audit-module
+├── transaction-module →  shared-module, account-module
+├── audit-module       →  shared-module
+├── schedule-module    →  shared-module, transaction-module
+└── alert-module       →  shared-module
 ```
 
 ---
@@ -99,8 +100,9 @@ app-module
 | Persistence | Spring Data JPA, Hibernate 6, Flyway |
 | Database | PostgreSQL (Neon cloud), native ENUM types |
 | Cache | Redis (Lettuce), Spring Cache (`@Cacheable`, `@CacheEvict`) |
-| Messaging | Redis pub/sub (`StringRedisTemplate`) |
+| Inter-module events | Spring `ApplicationEventPublisher` + `@TransactionalEventListener(AFTER_COMMIT)` |
 | Auth | JWT (JJWT 0.12.6), BCrypt password encoding, HttpOnly refresh-token cookie |
+| JWT blacklist | Redis `StringRedisTemplate` — `SET blacklist:{jti} EX {remainingTtl}` |
 | Observability | Spring Actuator, Micrometer, Prometheus |
 | API Docs | SpringDoc OpenAPI 2.8.6 (Swagger UI at `/swagger-ui.html`) |
 | Testing | JUnit 5, Mockito, AssertJ, Spring Test, JaCoCo |
@@ -176,7 +178,7 @@ Client                        Server
   ├─ POST /api/auth/refresh ─────►│  Read HttpOnly refresh_token cookie
   │                               │  Validate JWT, verify type = "refresh"
   │                               │  Blacklist old refresh token (JTI → Redis with TTL)
-  │◄── 200 { new token pair } ────┤  Issue new access + refresh tokens
+  │◄── 200 { new token pair } ────┤  Issue new access + refresh tokens (token rotation)
   │                               │
   ├─ POST /api/auth/logout ──────►│  Blacklist access token + refresh token by JTI
   │◄── 204 ───────────────────────┤  Clear refresh_token cookie (maxAge = 0)
@@ -214,7 +216,7 @@ accountRepository.existsByIdAndCustomerId(accountId, customerId) → 403 if fals
 
 ## Transaction Lifecycle
 
-The system uses a **PENDING-first, event-driven** state machine. The HTTP response returns immediately with `status: PENDING`; balance mutation happens asynchronously via Spring application events.
+The system uses a **PENDING-first, event-driven** state machine. The HTTP response returns immediately with `status: PENDING`; balance mutation happens via Spring `ApplicationEvent` consumed synchronously by the account-module.
 
 ```
 POST /api/transactions
@@ -234,37 +236,59 @@ POST /api/transactions
     └── FK violation   (23503) ──► 400 "Source/Target account not found"
         │
         ▼
-[Publish ApplicationEvent]  ← REQUIRES_NEW transaction (committed)
-  DepositRequestedEvent  /  WithdrawalRequestedEvent  /  TransferRequestedEvent
+[applicationEventPublisher.publishEvent()]  ← REQUIRES_NEW transaction
+  DepositRequestedEvent / WithdrawalRequestedEvent / TransferRequestedEvent
         │
         ▼
-  200 { status: "PENDING" }  ◄── client receives immediately
+  202 { status: "PENDING" }  ◄── client receives immediately
 
 ══════════════════════════════════════════════════════════
-  @Async  @TransactionalEventListener(AFTER_COMMIT)
+  account-module — @EventListener (synchronous, same thread)
 ══════════════════════════════════════════════════════════
         │
         ▼
 [AccountTransactionService]
-  SELECT … FOR UPDATE (row-level lock prevents concurrent balance races)
+  SELECT … FOR UPDATE — locks ordered by UUID ascending to prevent deadlock
   Account.credit() / Account.debit()
-  ├── InsufficientBalanceException ──► FAILED
-  └── success
+  ├── InsufficientBalanceException ──► publish TransactionResultEvent(FAILED)
+  └── success ──────────────────────► publish TransactionResultEvent(COMPLETED)
+
+══════════════════════════════════════════════════════════
+  transaction-module — @EventListener
+══════════════════════════════════════════════════════════
+        ├── COMPLETED ──► UPDATE tx status='COMPLETED', executed_at=now
+        └── FAILED    ──► UPDATE tx status='FAILED'
+
+══════════════════════════════════════════════════════════
+  audit-module — @TransactionalEventListener(AFTER_COMMIT)
+                 @Async("transferExecutor")
+══════════════════════════════════════════════════════════
+  Fires only after business transaction commits successfully
+  AuditLogSubscriber.onAuditLogEvent(AuditLogEvent)
         │
         ▼
-[TransferResultPublisher]  ← REQUIRES_NEW
-  Publishes TransactionResultEvent
-        │
-        ├── success=true  ──► UPDATE tx status='COMPLETED'
-        │                     INSERT audit_log (via Redis pub/sub)
-        │
-        └── success=false ──► UPDATE tx status='FAILED'
+  AuditLogPersistenceService.persist()
+  @Transactional(REQUIRES_NEW)
+  auditLogRepository.save()
 
 ══════════════════════════════════════════════════════════
   ReconciliationJob — every 60 s
 ══════════════════════════════════════════════════════════
   PENDING tx older than 2 min ──► mark FAILED
-  (handles lost events from crash or restart)
+  (safety net for events lost on application crash or restart)
+```
+
+### Deadlock prevention
+
+`AccountTransactionService` always acquires row locks in **ascending UUID order** when two accounts are involved (transfer, reverseTransfer). This eliminates circular wait — the only Coffman condition controllable at application level.
+
+```java
+List<UUID> ordered = sortAccountIds(sourceId, targetId); // ascending UUID
+Account first  = lockAccount(ordered.get(0));
+Account second = lockAccount(ordered.get(1));
+// map back to source/target for correct debit/credit direction
+Account source = ordered.get(0).equals(sourceId) ? first : second;
+Account target = ordered.get(0).equals(targetId) ? first : second;
 ```
 
 ### Transaction rollback
@@ -284,38 +308,50 @@ POST /api/transactions/{id}/rollback   (ADMIN only)
 [ReversalExecutor]
   DEPOSIT    → reverseDeposit    (debit the credited account)
   WITHDRAWAL → reverseWithdraw   (credit the debited account)
-  TRANSFER   → reverseTransfer   (debit target, credit source)
+  TRANSFER   → reverseTransfer   (debit target, credit source — same UUID lock order)
         │
         ├── success ──► INSERT rollback(SUCCESS)
         │               UPDATE tx status='ROLLED_BACK'
+        │               publish AuditLogEvent(TRANSACTION_ROLLED_BACK)
         │
-        └── failure ──► INSERT rollback(FAILED / PERMANENTLY_FAILED)
+        └── failure ──► INSERT rollback(FAILED) via REQUIRES_NEW tx
                         attempt < 3: caller may retry
-                        attempt = 3: PERMANENTLY_FAILED, no further retries
+                        attempt = 3: PERMANENTLY_FAILED, manual intervention required
 ```
 
 ---
 
 ## Audit Log Pipeline
 
-All state-changing operations publish an `AuditLogEvent` to Redis synchronously (fire-and-forget). The `audit-module` subscribes to the channel and persists events independently — a slow or failing audit write never blocks the business transaction.
+All state-changing operations publish an `AuditLogEvent` via Spring `ApplicationEventPublisher`. The `audit-module` subscribes using `@TransactionalEventListener(phase = AFTER_COMMIT)` — the audit write fires only **after** the business transaction successfully commits, ensuring no phantom entries for rolled-back operations. The listener runs on a dedicated async thread pool (`@Async("transferExecutor")`) so audit persistence never blocks the business transaction.
 
 ```
-Service layer                  Redis (audit:log)           audit-module
-      │                               │                         │
-      ├─ auditLogPublisher            │                         │
-      │  .publish(event)             │                         │
-      │  ObjectMapper → JSON ────────►│ pub to channel          │
-      │                               │                         │
-      │                               ├──── AuditLogSubscriber ►│
-      │                               │     (MessageListener)   │
-      │                               │                         ├─ deserialize JSON
-      │                               │                         ├─ AuditLogPersistenceService
-      │                               │                         │  @Transactional(REQUIRES_NEW)
-      │                               │                         └─ auditLogRepository.save()
+Service layer                              audit-module
+      │                                         │
+      ├─ applicationEventPublisher              │
+      │  .publishEvent(AuditLogEvent)           │
+      │                                         │
+      │  (business tx commits)                  │
+      │       │                                 │
+      │       └──── AFTER_COMMIT ──────────────►│
+      │             @Async("transferExecutor")  │
+      │                                         ├─ AuditLogSubscriber
+      │                                         │  .onAuditLogEvent(AuditLogEvent)
+      │                                         │
+      │                                         ├─ AuditLogPersistenceService
+      │                                         │  @Transactional(REQUIRES_NEW)
+      │                                         └─ auditLogRepository.save()
 ```
 
-Events published by each module:
+### ACCOUNT_ID population rule
+
+| Entity type | `account_id` value |
+|---|---|
+| `CUSTOMER` | `null` — no account involved |
+| `ACCOUNT` | `entity_id` — the account itself |
+| `TRANSACTION` | `source_account_id` — enables account-scoped queries without JOIN |
+
+### Events published by each module
 
 | Module | Actions |
 |---|---|
@@ -346,7 +382,7 @@ Each schedule is isolated in its own transaction — one failure does not abort 
 
 ### ReconciliationJob — every 60 s
 
-Marks PENDING transactions older than 2 minutes as FAILED in batches of 100. This handles events that were published to Redis but never consumed (e.g., application crash between publish and delivery).
+Marks PENDING transactions older than 2 minutes as FAILED in batches of 100. This handles events lost due to application crash between publish and consumption.
 
 ---
 
@@ -455,7 +491,7 @@ Excluded from coverage: `*Application.class`, `*ApplicationTests.class`, `**/con
 ```bash
 # Clone
 git clone <repo-url>
-cd baking_system
+cd banking_system
 
 # Build all modules (skip tests for a quick build)
 mvn clean install -DskipTests
